@@ -1,0 +1,707 @@
+diff --git a/src/Layers/xrRender/ModelPool.cpp b/src/Layers/xrRender/ModelPool.cpp
+index 4f615907..21a9aa3b 100644
+--- a/src/Layers/xrRender/ModelPool.cpp
++++ b/src/Layers/xrRender/ModelPool.cpp
+@@ -89,6 +89,7 @@ dxRender_Visual*	CModelPool::Instance_Duplicate	(dxRender_Visual* V)
+ 
+ dxRender_Visual*	CModelPool::Instance_Load		(const char* N, BOOL allow_register)
+ {
++	xrHitch::Scope zw_scope("ogf_load", N);
+ 	dxRender_Visual	*V;
+ 	string_path		fn;
+ 	string_path		name;
+diff --git a/src/Layers/xrRender/SH_Texture.h b/src/Layers/xrRender/SH_Texture.h
+index b5fe5843..9562325a 100644
+--- a/src/Layers/xrRender/SH_Texture.h
++++ b/src/Layers/xrRender/SH_Texture.h
+@@ -3,6 +3,7 @@
+ #pragma once
+ 
+ #include "../../xrCore/xr_resource.h"
++#include <atomic>
+ 
+ class  ENGINE_API CAviPlayerCustom;
+ class  CTheoraSurface;
+@@ -40,11 +41,27 @@ public:
+ 	ID3DBaseTexture*					surface_get 	();
+ 
+ 	IC BOOL								isUser			()		{ return flags.bUser;					}
+-	IC u32								get_Width		()		{ desc_enshure(); return desc.Width;	}
+-	IC u32								get_Height		()		{ desc_enshure(); return desc.Height;	}
++	IC u32								get_Width		()		{ AsyncWait(); desc_enshure(); return desc.Width;	}
++	IC u32								get_Height		()		{ AsyncWait(); desc_enshure(); return desc.Height;	}
+ 
+ #ifdef USE_DX11
+-	IC DXGI_FORMAT						get_Format		()		{ desc_enshure(); return desc.Format;	}
++	IC DXGI_FORMAT						get_Format		()		{ AsyncWait(); desc_enshure(); return desc.Format;	}
++#endif
++
++	// Background loading of textures that appear during play (IX-Ray CS build):
++	// the file is read and the GPU texture is created on a worker thread, a neutral
++	// placeholder is bound until it is ready, so new objects no longer stall the frame.
++	bool								LoadAsync		();
++#ifdef USE_DX11
++	void								AsyncWait		();
++	void								AsyncWork		();
++	void								apply_async		(u32	stage);
++	std::atomic<int>					m_async			{ 0 };	// 0 none, 1 queued, 2 loading, 3 ready
++	ID3DBaseTexture*					m_asyncSurface	= nullptr;
++	ID3DShaderResourceView*				m_asyncSRV		= nullptr;
++	u32									m_asyncMem		= 0;
++#else
++	void								AsyncWait		()		{}
+ #endif
+ 
+ 	void								video_Sync		(u32 _time){m_play_time=_time;}
+@@ -57,7 +74,7 @@ public:
+ 	virtual ~CTexture					();
+ 	
+ #ifdef USE_DX11
+-	ID3DShaderResourceView*				get_SRView() {return m_pSRView;}
++	ID3DShaderResourceView*				get_SRView() { AsyncWait(); return m_pSRView;}
+ #endif //USE_DX11
+ 
+ private:
+@@ -66,6 +83,8 @@ private:
+ 	void								desc_update		();
+ #ifdef USE_DX11
+ 	void								Apply			(u32 dwStage);
++	void								ApplyView		(u32 dwStage, ID3DShaderResourceView* view);
++	void								AsyncPublish	();
+ 	void								ProcessStaging();
+ 	D3D_USAGE							GetUsage();
+ #endif //USE_DX11
+diff --git a/src/Layers/xrRender/xrRender_console.cpp b/src/Layers/xrRender/xrRender_console.cpp
+index 2c1e5ee0..d7060c86 100644
+--- a/src/Layers/xrRender/xrRender_console.cpp
++++ b/src/Layers/xrRender/xrRender_console.cpp
+@@ -143,7 +143,7 @@ Flags32 ps_r2_ls_flags_ext =
+ 	R4FLAG_HASHED_ALPHA_TEST
+ };
+ 
+-Flags32 ps_r__common_flags = { R2FLAG_USE_BUMP | RFLAG_USE_CACHE | RFLAG_NO_RAM_TEXTURES | RFLAG_MT_TEX_LOAD };
++Flags32 ps_r__common_flags = { R2FLAG_USE_BUMP | RFLAG_USE_CACHE | RFLAG_NO_RAM_TEXTURES | RFLAG_MT_TEX_LOAD | RFLAG_ASYNC_TEX_LOAD };
+ 
+ int opt_static = 0;
+ int opt_dynamic = 0;
+@@ -750,6 +750,7 @@ void		xrRender_initconsole	()
+ 	CMD4(CCC_DetailRadius, "r__detail_radius", &ps_r__detail_radius, 10, 300);
+ 	CMD3(CCC_Mask, "r__no_ram_textures", &ps_r__common_flags, RFLAG_NO_RAM_TEXTURES);
+ 	CMD3(CCC_Mask, "r__mt_texture_load", &ps_r__common_flags, RFLAG_MT_TEX_LOAD);
++	CMD3(CCC_Mask, "r__async_texture_load", &ps_r__common_flags, RFLAG_ASYNC_TEX_LOAD);
+ 	CMD3(CCC_Token, "r_aa", &ps_r2_aa_type, aa_type_token);
+ 	CMD4(CCC_Integer, "r__optimize_static_geom", &opt_static, 0, 2);
+ 	CMD4(CCC_Integer, "r__optimize_dynamic_geom", &opt_dynamic, 0, 2);
+diff --git a/src/Layers/xrRender/xrRender_console.h b/src/Layers/xrRender/xrRender_console.h
+index c048dbd9..34e47315 100644
+--- a/src/Layers/xrRender/xrRender_console.h
++++ b/src/Layers/xrRender/xrRender_console.h
+@@ -190,6 +190,7 @@ enum
+ 	R4FLAG_PUDDLES					= (1<<16),
+ 	R4FLAG_OFFSCREEN_REFLECTIONS	= (1<<17),
+ 	R4FLAG_SSLR_ON_WORLD = (1<<18),
++	RFLAG_ASYNC_TEX_LOAD			= (1<<19),	// IX-Ray CS build: textures appearing during play load in background
+ };
+ 
+ extern void						xrRender_initconsole	();
+diff --git a/src/Layers/xrRenderDX10/dx11ResourceManager_Resources.cpp b/src/Layers/xrRenderDX10/dx11ResourceManager_Resources.cpp
+index 21a917cd..f5ee4ae7 100644
+--- a/src/Layers/xrRenderDX10/dx11ResourceManager_Resources.cpp
++++ b/src/Layers/xrRenderDX10/dx11ResourceManager_Resources.cpp
+@@ -602,7 +602,11 @@ CTexture* CResourceManager::_CreateTexture	(LPCSTR _Name)
+ 		T->dwFlags			|=	xr_resource_flagged::RF_REGISTERED;
+ 		m_textures.insert	(std::make_pair(T->set_name(Name),T));
+ 		T->Preload			();
+-		if (Device.b_is_Ready && !bDeferredLoad) T->Load();
++		if (Device.b_is_Ready && !bDeferredLoad)
++		{
++			if (!T->LoadAsync())
++				T->Load();
++		}
+ 		return		T;
+ 	}
+ }
+diff --git a/src/Layers/xrRenderDX10/dx11SH_Texture.cpp b/src/Layers/xrRenderDX10/dx11SH_Texture.cpp
+index e2e16c87..f88d9d2d 100644
+--- a/src/Layers/xrRenderDX10/dx11SH_Texture.cpp
++++ b/src/Layers/xrRenderDX10/dx11SH_Texture.cpp
+@@ -13,6 +13,218 @@
+ #include "../xrRender/dxRenderDeviceRender.h"
+ 
+ #include "StateManager/dx10ShaderResourceStateCache.h"
++#include "../../xrEngine/IGame_Level.h"
++
++#include <mutex>
++#include <condition_variable>
++#include <deque>
++#include <thread>
++
++//////////////////////////////////////////////////////////////////////
++// Background texture loading (IX-Ray CS build)
++//////////////////////////////////////////////////////////////////////
++namespace
++{
++	struct ZwTexQueue
++	{
++		std::mutex					lock;
++		std::condition_variable		cv;
++		std::deque<CTexture*>		items;
++		bool						started = false;
++	};
++
++	ZwTexQueue& zw_tex_queue()
++	{
++		static ZwTexQueue* q = new ZwTexQueue();	// never destroyed: worker threads may outlive static destruction
++		return *q;
++	}
++
++	void zw_tex_worker()
++	{
++		Platform::SetThreadName("X-Ray Texture Streaming");
++		ZwTexQueue& q = zw_tex_queue();
++		for (;;)
++		{
++			CTexture* T = nullptr;
++			{
++				std::unique_lock<std::mutex> guard(q.lock);
++				q.cv.wait(guard, [&q]() { return !q.items.empty(); });
++				T = q.items.front();
++				q.items.pop_front();
++				int expected = 1;
++				if (!T->m_async.compare_exchange_strong(expected, 2))
++					T = nullptr;		// taken over by the main thread
++			}
++			if (T)
++			{
++				T->AsyncWork();
++				T->m_async.store(3);
++			}
++		}
++	}
++
++	void zw_tex_enqueue(CTexture* T)
++	{
++		ZwTexQueue& q = zw_tex_queue();
++		{
++			std::lock_guard<std::mutex> guard(q.lock);
++			if (!q.started)
++			{
++				q.started = true;
++				for (int i = 0; i < 2; ++i)
++					std::thread(zw_tex_worker).detach();
++			}
++			q.items.push_back(T);
++		}
++		q.cv.notify_one();
++	}
++
++	// returns true when the caller now owns the job (it was still waiting in the queue)
++	bool zw_tex_claim(CTexture* T)
++	{
++		ZwTexQueue& q = zw_tex_queue();
++		std::lock_guard<std::mutex> guard(q.lock);
++		int expected = 1;
++		if (!T->m_async.compare_exchange_strong(expected, 2))
++			return false;
++		for (auto it = q.items.begin(); it != q.items.end(); ++it)
++		{
++			if (*it == T)
++			{
++				q.items.erase(it);
++				break;
++			}
++		}
++		return true;
++	}
++
++	ID3DShaderResourceView* zw_make_placeholder(u32 rgba)
++	{
++		D3D11_TEXTURE2D_DESC d = {};
++		d.Width = 1;
++		d.Height = 1;
++		d.MipLevels = 1;
++		d.ArraySize = 1;
++		d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++		d.SampleDesc.Count = 1;
++		d.Usage = D3D11_USAGE_IMMUTABLE;
++		d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
++		D3D11_SUBRESOURCE_DATA init = {};
++		init.pSysMem = &rgba;
++		init.SysMemPitch = 4;
++		init.SysMemSlicePitch = 4;
++		ID3D11Texture2D* tex = nullptr;
++		ID3DShaderResourceView* srv = nullptr;
++		if (SUCCEEDED(RDevice->CreateTexture2D(&d, &init, &tex)) && tex)
++		{
++			RDevice->CreateShaderResourceView(tex, nullptr, &srv);
++			tex->Release();
++		}
++		return srv;
++	}
++
++	// neutral stand-ins while a texture is loading: grey invisible colour, flat bump
++	ID3DShaderResourceView* zw_placeholder(LPCSTR name)
++	{
++		static ID3DShaderResourceView* diffuse = zw_make_placeholder(0x006E6E6Eu);	// rgb 110, alpha 0
++		static ID3DShaderResourceView* bump = zw_make_placeholder(0x8080FF40u);		// gloss .25, normal (0,0,1)
++		static ID3DShaderResourceView* bumpx = zw_make_placeholder(0x80808080u);
++		size_t len = name ? xr_strlen(name) : 0;
++		if (len > 6 && 0 == _stricmp(name + len - 6, "_bump#"))
++			return bumpx;
++		if (len > 5 && 0 == _stricmp(name + len - 5, "_bump"))
++			return bump;
++		return diffuse;
++	}
++}
++
++bool CTexture::LoadAsync()
++{
++	if (!ps_r__common_flags.test(RFLAG_ASYNC_TEX_LOAD))
++		return false;
++	if (!Device.b_is_Ready || pSurface || m_async.load() != 0)
++		return false;
++	if (!g_pGameLevel || !g_pGameLevel->bReady)
++		return false;		// menus and level loading keep the usual path
++
++	LPCSTR n = *cName;
++	if (!n || !n[0] || n[0] == '$' || strstr(n, "$user$"))
++		return false;
++	static const char* prefixes[] = { "ui\\", "ui_", "intro", "fonts", "shaders\\", "lights\\", "levels\\", "terrain\\", "ed\\" };
++	for (const char* p : prefixes)
++		if (n == strstr(n, p))
++			return false;
++	if (strstr(n, "sky") || strstr(n, "lut") || strstr(n, "$rt"))
++		return false;
++
++	string_path fn;
++	if (FS.exist(fn, "$game_textures$", n, ".ogm") || FS.exist(fn, "$game_textures$", n, ".avi") || FS.exist(fn, "$game_textures$", n, ".seq"))
++		return false;
++
++	Preload();
++	flags.bLoaded = true;
++	flags.bUser = false;
++	flags.MemoryUsage = 0;
++	desc_cache = 0;
++	m_async.store(1);
++	bind = xr_make_delegate(this, &CTexture::apply_async);
++	zw_tex_enqueue(this);
++	return true;
++}
++
++void CTexture::AsyncWork()
++{
++	u32 mem = 0;
++	ID3DBaseTexture* surf = ::RImplementation.texture_load(*cName, mem, false);
++	ID3DShaderResourceView* srv = nullptr;
++	if (surf && FAILED(RDevice->CreateShaderResourceView(surf, nullptr, &srv)))
++		srv = nullptr;
++	m_asyncSurface = surf;
++	m_asyncSRV = srv;
++	m_asyncMem = mem;
++}
++
++void CTexture::AsyncPublish()
++{
++	int expected = 3;
++	if (!m_async.compare_exchange_strong(expected, 0))
++		return;
++	pSurface = m_asyncSurface;
++	m_pSRView = m_asyncSRV;
++	m_asyncSurface = nullptr;
++	m_asyncSRV = nullptr;
++	flags.MemoryUsage = m_asyncMem;
++	desc_cache = 0;
++	PostLoad();
++}
++
++void CTexture::AsyncWait()
++{
++	int s = m_async.load();
++	if (s == 0)
++		return;
++	if (s == 1 && zw_tex_claim(this))
++	{
++		xrHitch::Scope zw_scope("tex_wait", *cName);
++		AsyncWork();
++		m_async.store(3);
++	}
++	while (m_async.load() == 2)
++		std::this_thread::yield();
++	AsyncPublish();
++}
++
++void CTexture::apply_async(u32 dwStage)
++{
++	if (m_async.load() == 3)
++		AsyncPublish();
++	if (m_async.load() == 0)
++	{
++		bind(dwStage);
++		return;
++	}
++	ApplyView(dwStage, zw_placeholder(*cName));
++}
+ 
+ #define		PRIORITY_HIGH	12
+ #define		PRIORITY_NORMAL	8
+@@ -132,6 +344,11 @@ ID3DBaseTexture*	CTexture::surface_get	()
+ 
+ void CTexture::PostLoad	()
+ {
++	if (m_async.load() != 0)
++	{
++		bind = xr_make_delegate(this, &CTexture::apply_async);
++		return;
++	}
+ 	if (pTheora)				bind		= xr_make_delegate(this,&CTexture::apply_theora);
+ 	else if (pAVI)				bind		= xr_make_delegate(this,&CTexture::apply_avi);
+ 	else if (!seqDATA.empty())	bind		= xr_make_delegate(this,&CTexture::apply_seq);
+@@ -139,7 +356,7 @@ void CTexture::PostLoad	()
+ }
+ 
+ void CTexture::apply_load	(u32 dwStage)	{
+-	if (!flags.bLoaded)		Load			()	;
++	if (!flags.bLoaded)		{ if (!LoadAsync()) Load(); }
+ 	else					PostLoad		()	;
+ 	bind					(dwStage)			;
+ };
+@@ -232,6 +449,11 @@ void CTexture::Apply(u32 dwStage)
+ 	if (flags.bLoadedAsStaging)
+ 		ProcessStaging();
+ 
++	ApplyView(dwStage, m_pSRView);
++}
++
++void CTexture::ApplyView(u32 dwStage, ID3DShaderResourceView* m_pSRView)
++{
+ 	if (dwStage<rstVertex)	//	Pixel shader stage resources
+ 	{
+ 		//RDevice->PSSetShaderResources(dwStage, 1, &m_pSRView);
+@@ -349,6 +571,13 @@ void CTexture::Preload	()
+ void CTexture::Load		()
+ {
+ 	PROF_EVENT("CTexture::Load");
++	if (m_async.load() != 0)
++	{
++		AsyncWait();
++		if (pSurface)
++			return;
++	}
++	xrHitch::Scope zw_scope("tex", *cName);
+ 
+ 	flags.bLoaded					= true;
+ 	desc_cache						= 0;
+@@ -535,6 +764,7 @@ void CTexture::Unload	()
+ #endif // DEBUG
+ 
+ 	//.	if (flags.bLoaded)		Msg		("* Unloaded: %s",cName.c_str());
++	AsyncWait();
+ 
+ 	flags.bLoaded			= FALSE;
+ 	flags.bLoadedAsStaging	= FALSE;
+diff --git a/src/Layers/xrRenderDX9/dx9SH_Texture.cpp b/src/Layers/xrRenderDX9/dx9SH_Texture.cpp
+index b4b1c511..35967ded 100644
+--- a/src/Layers/xrRenderDX9/dx9SH_Texture.cpp
++++ b/src/Layers/xrRenderDX9/dx9SH_Texture.cpp
+@@ -140,6 +140,8 @@ void CTexture::apply_normal	(u32 dwStage)	{
+ 	CHK_DX(RDevice->SetTexture(dwStage,pSurface));
+ };
+ 
++bool CTexture::LoadAsync()	{ return false; }	// background loading is implemented for DX11 only
++
+ void CTexture::Preload	()
+ {
+ 	m_bumpmap = DEV->m_textures_description.GetBumpName(cName);
+diff --git a/src/xrCore/xrCore.h b/src/xrCore/xrCore.h
+index 97ded82d..537ac20e 100644
+--- a/src/xrCore/xrCore.h
++++ b/src/xrCore/xrCore.h
+@@ -165,6 +165,7 @@ using xr_optional = std::optional<T>;
+ #include "LocatorAPI.h"
+ #include "FileSystem.h"
+ #include "FTimer.h"
++#include "xrHitchStats.h"
+ #include "intrusive_ptr.h"
+ 
+ #include "net_utils.h"
+diff --git a/src/xrCore/xrHitchStats.cpp b/src/xrCore/xrHitchStats.cpp
+new file mode 100644
+index 00000000..9ba97541
+--- /dev/null
++++ b/src/xrCore/xrHitchStats.cpp
+@@ -0,0 +1,105 @@
++#include "stdafx.h"
++#include "xrHitchStats.h"
++
++#include <mutex>
++
++namespace xrHitch
++{
++	XRCORE_API int g_log_ms = 100;
++
++	namespace
++	{
++		struct Item
++		{
++			string128 name;
++			float ms;
++		};
++
++		struct Category
++		{
++			const char* id = nullptr;
++			float total = 0.f;
++			u32 count = 0;
++			Item top[4] = {};
++			u32 top_n = 0;
++		};
++
++		std::mutex g_lock;
++		Category g_cats[24];
++		u32 g_cats_n = 0;
++
++		Category* find(const char* id)
++		{
++			for (u32 i = 0; i < g_cats_n; ++i)
++				if (g_cats[i].id == id || 0 == xr_strcmp(g_cats[i].id, id))
++					return &g_cats[i];
++			if (g_cats_n >= 24)
++				return nullptr;
++			Category& c = g_cats[g_cats_n++];
++			c = Category();
++			c.id = id;
++			return &c;
++		}
++	}
++
++	void Add(const char* category, const char* name, float ms)
++	{
++		if (g_log_ms <= 0 || ms < 0.05f)
++			return;
++		std::lock_guard<std::mutex> guard(g_lock);
++		Category* c = find(category);
++		if (!c)
++			return;
++		c->total += ms;
++		c->count++;
++		if (!name || !name[0] || ms < 1.f)
++			return;
++		// keep the 4 slowest items of the category
++		u32 slot = c->top_n;
++		if (c->top_n < 4)
++			c->top_n++;
++		else
++		{
++			slot = 0;
++			for (u32 i = 1; i < 4; ++i)
++				if (c->top[i].ms < c->top[slot].ms)
++					slot = i;
++			if (c->top[slot].ms >= ms)
++				return;
++		}
++		xr_strcpy(c->top[slot].name, name);
++		c->top[slot].ms = ms;
++	}
++
++	void FrameEnd(float frame_ms)
++	{
++		if (g_log_ms <= 0)
++			return;
++		std::lock_guard<std::mutex> guard(g_lock);
++		if (frame_ms >= float(g_log_ms) && g_cats_n)
++		{
++			string4096 line;
++			xr_sprintf(line, "[hitch] %.0f ms:", frame_ms);
++			for (u32 i = 0; i < g_cats_n; ++i)
++			{
++				const Category& c = g_cats[i];
++				if (c.total < 1.f)
++					continue;
++				string512 part;
++				xr_sprintf(part, " | %s %.0f ms x%u", c.id, c.total, c.count);
++				xr_strcat(line, part);
++				for (u32 k = 0; k < c.top_n; ++k)
++				{
++					string256 it;
++					xr_sprintf(it, "%s%s %.0f", k == 0 ? " (" : ", ", c.top[k].name, c.top[k].ms);
++					if (xr_strlen(line) + xr_strlen(it) + 8 < sizeof(line))
++						xr_strcat(line, it);
++				}
++				if (c.top_n)
++					xr_strcat(line, ")");
++			}
++			Msg("%s", line);
++		}
++		g_cats_n = 0;
++	}
++}
+diff --git a/src/xrCore/xrHitchStats.h b/src/xrCore/xrHitchStats.h
+new file mode 100644
+index 00000000..c25d49e3
+--- /dev/null
++++ b/src/xrCore/xrHitchStats.h
+@@ -0,0 +1,32 @@
++#pragma once
++// Hitch reporter: when a frame takes longer than ixr_hitch_log (ms), the log gets one line
++// with the time spent in the frame stages and in resource loading (textures, models, spawns...).
++// Cheap when off (ixr_hitch_log 0): every probe is a single integer test.
++
++namespace xrHitch
++{
++	extern XRCORE_API int g_log_ms;
++
++	XRCORE_API void Add(const char* category, const char* name, float ms);
++	XRCORE_API void FrameEnd(float frame_ms);
++
++	struct Scope
++	{
++		const char* category;
++		const char* name;
++		u64 start;
++		Scope(const char* c, const char* n) : category(c), name(n), start(0)
++		{
++			if (g_log_ms > 0)
++				start = u64(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
++		}
++		~Scope()
++		{
++			if (g_log_ms > 0 && start)
++			{
++				u64 now = u64(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
++				Add(category, name, float(double(now - start) / 1000.0));
++			}
++		}
++	};
++}
+diff --git a/src/xrEngine/EngineThreading.cpp b/src/xrEngine/EngineThreading.cpp
+index 0beabad3..9be743d5 100644
+--- a/src/xrEngine/EngineThreading.cpp
++++ b/src/xrEngine/EngineThreading.cpp
+@@ -44,24 +44,28 @@ void XRay::Engine::GameThread()
+ 		// we has granted permission to execute
+ 	{
+ 		PROF_EVENT("g_hud OnFrameMT")
++			xrHitch::Scope zw_scope("gt_hud", nullptr);
+ 			if (g_hud)
+ 				g_hud->OnFrameMT();
+ 	}
+ 
+ 	{
+ 		PROF_EVENT("SoundEvent_Dispatch")
++			xrHitch::Scope zw_scope("gt_sound_events", nullptr);
+ 			if (g_pGameLevel && g_pGameLevel->bReady)
+ 				g_pGameLevel->SoundEvent_Dispatch();
+ 	}
+ 
+ 	{
+ 		PROF_EVENT("Sheduler")
++			xrHitch::Scope zw_scope("gt_scheduler", nullptr);
+ 			if (!Device.Paused())
+ 				::Engine.Sheduler.Update();
+ 	}
+ 
+ 	{
+ 		PROF_EVENT("seqParallel")
++			xrHitch::Scope zw_scope("gt_parallel", nullptr);
+ 			for (u32 pit = 0; pit < Device.seqParallel.size(); pit++)
+ 				Device.seqParallel[pit]();
+ 		Device.seqParallel.resize(0);
+@@ -69,6 +73,7 @@ void XRay::Engine::GameThread()
+ 
+ 	{
+ 		PROF_EVENT("seqFrameMT")
++			xrHitch::Scope zw_scope("gt_frame_mt", nullptr);
+ 			Device.seqFrameMT.Process(rp_Frame);
+ 	}
+ 
+diff --git a/src/xrEngine/device.cpp b/src/xrEngine/device.cpp
+index bc500b8c..b672e2c1 100644
+--- a/src/xrEngine/device.cpp
++++ b/src/xrEngine/device.cpp
+@@ -177,6 +177,7 @@ void CRenderDevice::on_idle		()
+ 
+ 	PROF_FRAME("Main Thread");
+ 	Platform::SetThreadName("X-Ray Primary Thread");
++	const auto zw_frame_start = std::chrono::steady_clock::now();
+ 
+ 	Device.BeginRender();
+ 	const bool Minimized = SDL_GetWindowFlags(g_AppInfo.Window) & SDL_WINDOW_MINIMIZED;
+@@ -196,6 +197,7 @@ void CRenderDevice::on_idle		()
+ 		}
+ 		PROF_EVENT("LoadDraw");
+ 		pApp->LoadDraw();
++		xrHitch::FrameEnd(0.f);	// loading screens are not hitches
+ 
+ 		return;
+ 	}
+@@ -203,6 +205,7 @@ void CRenderDevice::on_idle		()
+ 	{
+ 		{
+ 			PROF_EVENT("Update Particles");
++			xrHitch::Scope zw_scope("particles", nullptr);
+ 			if (g_pGamePersistent)
+ 				g_pGamePersistent->UpdateParticles();
+ 
+@@ -237,7 +240,10 @@ void CRenderDevice::on_idle		()
+ 		}
+ 
+ 		secondary_tasks.run(&XRay::Engine::PreRenderThread);
+-		FrameMove();
++		{
++			xrHitch::Scope zw_scope("frame_move", nullptr);
++			FrameMove();
++		}
+ 	}
+ 
+ 	// Precache
+@@ -292,6 +298,7 @@ void CRenderDevice::on_idle		()
+ 		Statistic->RenderTOTAL_Real.Begin();
+ 		if (b_is_Active)
+ 		{
++			xrHitch::Scope zw_scope("render", nullptr);
+ 			if (Begin())
+ 			{
+ 				seqRender.Process(rp_Render);
+@@ -305,9 +312,16 @@ void CRenderDevice::on_idle		()
+ 		Statistic->RenderTOTAL_Real.FrameEnd();
+ 		Statistic->RenderTOTAL.accum = Statistic->RenderTOTAL_Real.accum;
+ 	}
+-	secondary_tasks.wait();
++	{
++		xrHitch::Scope zw_scope("wait_game_thread", nullptr);
++		secondary_tasks.wait();
++	}
+ 
+-	Device.EndRender();
++	{
++		xrHitch::Scope zw_scope("end_render", nullptr);
++		Device.EndRender();
++	}
++	xrHitch::FrameEnd(float(double(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - zw_frame_start).count()) / 1000.0));
+ 	if (!b_is_Active)
+ 	{
+ 		Sleep(1);
+diff --git a/src/xrEngine/xr_ioc_cmd.cpp b/src/xrEngine/xr_ioc_cmd.cpp
+index ce00a702..569dd9aa 100644
+--- a/src/xrEngine/xr_ioc_cmd.cpp
++++ b/src/xrEngine/xr_ioc_cmd.cpp
+@@ -705,6 +705,7 @@ void CCC_Register()
+ 	
+ 	CMD2(CCC_Boolean,	"rs_fps_show",			&IsFpsShow);
+ 	CMD4(CCC_Integer,	"rs_fps_limit",			&g_dwFPSlimit,		0, 1000);
++	CMD4(CCC_Integer,	"ixr_hitch_log",		&xrHitch::g_log_ms,	0, 100000);
+ 
+ 	CMD3(CCC_Mask,		"rs_v_sync",			&psDeviceFlags,		rsVSync				);
+ 	
+diff --git a/src/xrGame/Level_network_spawn.cpp b/src/xrGame/Level_network_spawn.cpp
+index ce04d06d..95e7671d 100644
+--- a/src/xrGame/Level_network_spawn.cpp
++++ b/src/xrGame/Level_network_spawn.cpp
+@@ -85,6 +85,7 @@ void CLevel::g_cl_Spawn		(LPCSTR name, u8 rp, u16 flags, Fvector pos)
+ 
+ void CLevel::g_sv_Spawn		(CSE_Abstract* E)
+ {
++	xrHitch::Scope zw_scope("spawn", E ? E->s_name.c_str() : nullptr);
+ 	//-----------------------------------------------------------------
+ //	CTimer		T(false);
+ 

@@ -1,0 +1,100 @@
+name: 'ZW engine build (IX-Ray r1.3.6 + patches)'
+
+on:
+  push:
+    branches: [zw-ci]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    steps:
+      - name: Checkout patches
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
+      - name: Get engine source r1.3.6
+        run: |
+          git config --global core.autocrlf false
+          git clone --depth 1 --branch r1.3.6 https://github.com/ixray-team/ixray-1.6-stcop.git engine
+
+      - name: Apply patches
+        working-directory: engine
+        run: |
+          Get-ChildItem ../ci/patches/*.patch | Sort-Object Name | ForEach-Object {
+            Write-Host "applying $($_.Name)"
+            git apply --whitespace=nowarn $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "patch failed: $($_.Name)" }
+          }
+          git status --short
+
+      - name: Cache packages
+        uses: actions/cache@v4
+        with:
+          key: Engine-NuGet-${{ hashFiles('engine/**/Packages.config') }}
+          restore-keys: |
+            Engine-NuGet-
+          path: |
+            ~/.nuget/packages
+
+      - name: Configure
+        working-directory: engine
+        run: |
+          cmd /c "cmake --preset Engine-x64-Windows > ..\build.log 2>&1"
+          $code = $LASTEXITCODE
+          Get-Content ..\build.log -Tail 60
+          exit $code
+
+      - name: Build
+        working-directory: engine
+        run: |
+          cmd /c "cmake --build --preset Engine-x64-Windows-RelWithDebInfo >> ..\build.log 2>&1"
+          $code = $LASTEXITCODE
+          Get-Content ..\build.log -Tail 80
+          exit $code
+
+      - name: Publish binaries to branch zw-builds
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          $bin = "engine/build/x64/Engine-Windows/bin/RelWithDebInfo"
+          New-Item -ItemType Directory -Force out/bin | Out-Null
+          Copy-Item "$bin/*.exe","$bin/*.dll" out/bin/
+          "source: r1.3.6 + patches from ${{ github.sha }}`nrun: ${{ github.run_number }}" | Set-Content out/BUILD_INFO.txt
+          cd out
+          git init -q
+          git config user.name "zw-ci"
+          git config user.email "zw-ci@users.noreply.github.com"
+          git checkout -q -b zw-builds
+          git add -A
+          git commit -q -m "build ${{ github.run_number }} from ${{ github.sha }}"
+          git push -f "https://x-access-token:$env:TOKEN@github.com/${{ github.repository }}.git" zw-builds
+
+      - name: Publish log on failure to branch zw-logs
+        if: failure()
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force logout | Out-Null
+          if (Test-Path build.log) {
+            Select-String -Path build.log -Pattern "error|fatal|failed" -CaseSensitive:$false | Select-Object -First 300 | ForEach-Object { $_.Line } | Set-Content logout/errors.txt
+            Get-Content build.log -Tail 400 | Set-Content logout/tail.txt
+          } else { "no build.log" | Set-Content logout/errors.txt }
+          "run ${{ github.run_number }} from ${{ github.sha }}" | Set-Content logout/BUILD_INFO.txt
+          cd logout
+          git init -q
+          git config user.name "zw-ci"
+          git config user.email "zw-ci@users.noreply.github.com"
+          git checkout -q -b zw-logs
+          git add -A
+          git commit -q -m "failed run ${{ github.run_number }}"
+          git push -f "https://x-access-token:$env:TOKEN@github.com/${{ github.repository }}.git" zw-logs
