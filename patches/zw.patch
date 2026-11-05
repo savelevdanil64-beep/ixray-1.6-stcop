@@ -723,17 +723,55 @@ index ce00a702..569dd9aa 100644
  	CMD3(CCC_Mask,		"rs_v_sync",			&psDeviceFlags,		rsVSync				);
  	
 diff --git a/src/xrGame/Level.cpp b/src/xrGame/Level.cpp
-index 327ea4a7..24b3a5d0 100644
+index 327ea4a7..030c0a6d 100644
 --- a/src/xrGame/Level.cpp
 +++ b/src/xrGame/Level.cpp
-@@ -450,9 +450,16 @@ void CLevel::cl_Process_Event				(u16 dest, u16 type, NET_Packet& P)
- 	}
- };
+@@ -80,10 +80,17 @@ u32			lvInterpSteps		= 0;
+ // Construction/Destruction
+ //////////////////////////////////////////////////////////////////////
  
 +// IX-Ray CS build: objects that come online are spread over several frames instead of
 +// spawning dozens of them (models, inventories, AI) in one frame. 0 = off.
 +int g_zw_spawn_budget_ms = 6;
 +static bool s_zw_spawn_budgeted = false;
++static bool s_zw_initial_drained = false;	// the burst right after loading is never spread
++
+ CLevel::CLevel():
+ 	IPureClient(Device.GetTimerGlobal())
+ {
+ 	PROF_EVENT("CLevel::CLevel");
++	s_zw_initial_drained = false;
+ 	
+ 	LoadCallbackGlobals(m_isStartAttack, m_onStartAttack, "OnStartAttack");
+ 	LoadCallbackGlobals(m_isKeyPress, m_onKeyPress, "OnKeyPress");
+@@ -450,9 +457,36 @@ void CLevel::cl_Process_Event				(u16 dest, u16 type, NET_Packet& P)
+ 	}
+ };
+ 
++// true when the next queued event spawns an item into an owner (an npc's inventory):
++// those stay in the same frame as their owner, so nobody appears without his weapon
++static bool zw_next_is_child_spawn(NET_Queue_Event* q)
++{
++	if (!q || q->queue.empty())
++		return false;
++	const NET_Event& e = q->queue.front();
++	if (e.ID != M_SPAWN)
++		return false;
++	const u8* d = e.data.data();
++	const size_t n = e.data.size();
++	size_t p = 2;					// u16 M_SPAWN
++	for (int s = 0; s < 2; ++s)		// section, name_replace
++	{
++		while (p < n && d[p])
++			++p;
++		++p;
++	}
++	p += 1 + 1 + 12 + 12 + 2 + 2;	// game id, rp, position, angle, respawn time, id
++	if (p + 2 > n)
++		return false;
++	const u16 parent = u16(d[p] | (u16(d[p + 1]) << 8));
++	return parent != u16(-1);
++}
 +
  void CLevel::ProcessGameEvents		()
  {
@@ -743,17 +781,18 @@ index 327ea4a7..24b3a5d0 100644
  	// Game events
  	{
  		NET_Packet			P;
-@@ -465,6 +472,9 @@ void CLevel::ProcessGameEvents		()
+@@ -465,6 +499,10 @@ void CLevel::ProcessGameEvents		()
  
  		while	(game_events->available(svT))
  		{
-+			if (zw_spawned && s_zw_spawn_budgeted && g_zw_spawn_budget_ms > 0 && bReady &&
-+				std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - zw_t0).count() >= g_zw_spawn_budget_ms)
++			if (zw_spawned && s_zw_spawn_budgeted && s_zw_initial_drained && g_zw_spawn_budget_ms > 0 && bReady &&
++				std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - zw_t0).count() >= g_zw_spawn_budget_ms &&
++				!zw_next_is_child_spawn(game_events))
 +				break;	// the rest of the queue (in order) goes on the next frame
  			u16 ID,dest,type;
  			game_events->get	(ID,dest,type,P);
  
-@@ -476,6 +486,7 @@ void CLevel::ProcessGameEvents		()
+@@ -476,6 +514,7 @@ void CLevel::ProcessGameEvents		()
  					u16 dummy16;
  					P.r_begin(dummy16);
  					cl_Process_Spawn(P);
@@ -761,13 +800,17 @@ index 327ea4a7..24b3a5d0 100644
  				}break;
  			case M_EVENT:
  				{
-@@ -600,7 +611,9 @@ void CLevel::OnFrame()
+@@ -600,7 +639,13 @@ void CLevel::OnFrame()
  		Device.Statistic->netClient1.End();
  	}
  
 +	s_zw_spawn_budgeted = true;
  	ProcessGameEvents();
 +	s_zw_spawn_budgeted = false;
++	if (!bReady)
++		s_zw_initial_drained = false;
++	else if (game_events->queue.empty())
++		s_zw_initial_drained = true;
  
  
  	if (m_bNeed_CrPr)					make_NetCorrectionPrediction();
