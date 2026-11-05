@@ -827,6 +827,38 @@ index ce04d06d..a497ec8e 100644
  	//-----------------------------------------------------------------
  //	CTimer		T(false);
  
+diff --git a/src/xrGame/WeaponMagazined.cpp b/src/xrGame/WeaponMagazined.cpp
+index 9c40c1ba..9ce7e039 100644
+--- a/src/xrGame/WeaponMagazined.cpp
++++ b/src/xrGame/WeaponMagazined.cpp
+@@ -524,7 +524,7 @@ bool CWeaponMagazined::TryReload()
+ 			SwitchState(eReload);
+ 			return true;
+ 		}
+-		else if (m_set_next_ammoType_on_reload == undefined_ammo_type && iAmmoElapsed + (IsGrenadeMode() ? 0 : iAmmoChamberElapsed) == 0 || m_set_next_ammoType_on_reload != undefined_ammo_type)
++		else	// IX-Ray CS build: like Anomaly, switch to any other suitable ammo even with rounds left in the magazine
+ 		{
+ 			for (u8 i = 0; i < u8(m_ammoTypes.size()); ++i)
+ 			{
+@@ -538,9 +538,6 @@ bool CWeaponMagazined::TryReload()
+ 					return true;
+ 				}
+ 			}
+-		}
+-		else
+-		{
+ 			m_set_next_ammoType_on_reload = undefined_ammo_type;
+ 		}
+ 
+@@ -775,7 +772,7 @@ bool CWeaponMagazined::HaveCartridgeInInventory(u8 cnt)
+ 
+ 	u32 ac = GetAmmoCount(GetTargetAmmoType());
+ 
+-	if (m_set_next_ammoType_on_reload == undefined_ammo_type && ac < cnt && iAmmoElapsed + iAmmoChamberElapsed == 0)
++	if (m_set_next_ammoType_on_reload == undefined_ammo_type && ac < cnt)
+ 	{
+ 		for (u8 i = 0; i < u8(m_ammoTypes.size()); ++i)
+ 		{
 diff --git a/src/xrGame/console_commands.cpp b/src/xrGame/console_commands.cpp
 index c8279945..3e882e87 100644
 --- a/src/xrGame/console_commands.cpp
