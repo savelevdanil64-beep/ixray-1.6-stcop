@@ -878,6 +878,61 @@ index 9c40c1ba..70cfe0b1 100644
  							}
  
  							if (get_any == nullptr || get_any->cast_weapon_ammo() == nullptr)
+diff --git a/src/xrGame/ai/stalker/ai_stalker.cpp b/src/xrGame/ai/stalker/ai_stalker.cpp
+index 60d44361..dc0c2247 100644
+--- a/src/xrGame/ai/stalker/ai_stalker.cpp
++++ b/src/xrGame/ai/stalker/ai_stalker.cpp
+@@ -935,18 +935,33 @@ void CAI_Stalker::shedule_Update(u32 DT)
+ 		animation().play_delayed_callbacks();
+ 
+ #ifndef USE_SCHEDULER_IN_AGENT_MANAGER
+-		agent_manager().update();
++		{
++			xrHitch::Scope zw_scope("npc_agent", nullptr);
++			agent_manager().update();
++		}
+ #endif // USE_SCHEDULER_IN_AGENT_MANAGER
+ 
+-		Exec_Visibility();
++		{
++			xrHitch::Scope zw_scope("npc_visibility", nullptr);
++			Exec_Visibility();
++		}
+ 
+-		process_enemies();
++		{
++			xrHitch::Scope zw_scope("npc_enemies", nullptr);
++			process_enemies();
++		}
+ 
+ 		PROF_EVENT("update memory");
+-		memory().update(dt);
++		{
++			xrHitch::Scope zw_scope("npc_memory", nullptr);
++			memory().update(dt);
++		}
+ 	}
+ 
+-	inherited::inherited::shedule_Update(DT);
++	{
++		xrHitch::Scope zw_scope("npc_base", nullptr);
++		inherited::inherited::shedule_Update(DT);
++	}
+ 
+ 	if (!Remote())
+ 	{
+@@ -995,7 +1010,10 @@ void CAI_Stalker::shedule_Update(u32 DT)
+ 	}
+ 	VERIFY(_valid(Position()));
+ 
+-	UpdateInventoryOwner(DT);
++	{
++		xrHitch::Scope zw_scope("npc_inventory", nullptr);
++		UpdateInventoryOwner(DT);
++	}
+ 
+ 	PROF_EVENT("physics");
+ 	VERIFY(_valid(Position()));
 diff --git a/src/xrGame/console_commands.cpp b/src/xrGame/console_commands.cpp
 index c8279945..3e882e87 100644
 --- a/src/xrGame/console_commands.cpp
@@ -893,3 +948,15 @@ index c8279945..3e882e87 100644
  	CMD3(CCC_Mask, "ai_debug", &psAI_Flags, aiDebug);
  	CMD3(CCC_Mask, "ai_dbg_brain", &psAI_Flags, aiBrain);
  	CMD3(CCC_Mask, "ai_dbg_motion", &psAI_Flags, aiMotion);
+diff --git a/src/xrGame/script_binder.cpp b/src/xrGame/script_binder.cpp
+index 38cc5090..2ec58f3a 100644
+--- a/src/xrGame/script_binder.cpp
++++ b/src/xrGame/script_binder.cpp
+@@ -151,6 +151,7 @@ void CScriptBinder::shedule_Update	(u32 time_delta)
+ 	if (m_object)
+ 	{
+ 		try {
++			xrHitch::Scope zw_scope("lua_binder", nullptr);
+ 			m_object->shedule_Update(time_delta);
+ 		}
+ 		catch (...) {
